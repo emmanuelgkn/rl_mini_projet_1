@@ -18,12 +18,25 @@ from rl_mind.evaluation import Evaluator
 from rl_mind.notebook import run_directory, setup_tensorboard, silence_known_warnings
 
 
+def make_mlp(sizes: list[int], output_activation=None, use_layer_norm: bool = False) -> nn.Module:
+    layers = []
+    for i in range(len(sizes) - 1):
+        layers.append(nn.Linear(sizes[i], sizes[i+1]))
+        if i < len(sizes) - 2:
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(sizes[i+1]))
+            layers.append(nn.ReLU())
+    if output_activation is not None:
+        layers.append(output_activation)
+    return nn.Sequential(*layers)
+
+
 class ContinuousQNetwork(nn.Module):
     """The Q-network $Q(s, a)$ for continuous actions"""
 
-    def __init__(self, obs_dim: int, hidden: tuple[int, ...], action_dim: int):
+    def __init__(self, obs_dim: int, hidden: tuple[int, ...], action_dim: int, use_layer_norm: bool = False):
         super().__init__()
-        self.model = build_mlp([obs_dim + action_dim, *hidden, 1])
+        self.model = make_mlp([obs_dim + action_dim, *hidden, 1], use_layer_norm=use_layer_norm)
 
     def forward(self, obs: Tensor, action: Tensor) -> Tensor:
         """Compute $Q(s, a)$ for a batch: `[B, obs_dim] x [B, action_dim] -> [B]`"""
@@ -31,10 +44,10 @@ class ContinuousQNetwork(nn.Module):
 
 
 class ContinuousDeterministicActor(Actor[Action]):
-    def __init__(self, obs_dim: int, hidden: tuple[int, ...], action_dim: int):
+    def __init__(self, obs_dim: int, hidden: tuple[int, ...], action_dim: int, use_layer_norm: bool = False):
         super().__init__()
-        self.model = build_mlp(
-            [obs_dim, *hidden, action_dim], output_activation=nn.Tanh()
+        self.model = make_mlp(
+            [obs_dim, *hidden, action_dim], output_activation=nn.Tanh(), use_layer_norm=use_layer_norm
         )
 
     def forward(self, obs: Tensor) -> Action:
@@ -70,7 +83,6 @@ def compute_critic_loss(
     """
     # Compute the target (do not bootstrap when `batch.terminated`), then the MSE loss
     
-
     target = batch.reward + gamma * next_q_values * (~batch.terminated)
 
     return F.mse_loss(q_values, target)
@@ -107,7 +119,8 @@ class DDPGConfig:
     action_noise: float = 0.1
 
     actor_hidden: tuple[int, ...] = (64, 64)
-    critic_hidden: tuple[int, ...] = (64, 64)
+    critic_hidden: tuple[int, ...] = (64, 64) # c'est ici pour changer le nombre de couches cachée
+    use_layer_norm: bool = True
     lr_actor: float = 1e-3
     lr_critic: float = 1e-3
 
@@ -121,18 +134,20 @@ def log_overestimation_bias(
     step: int,
     critic: nn.Module,
     actor: Actor,
-    batch: Transitions[Action],
+    eval_env: VecEnv,
     true_return: float
 ):
     """
     Calcule le biais de surestimation et l'enregistre sur TensorBoard.
-    Le biais est approximé par la différence entre la valeur Q moyenne estimée sur le batch 
-    et le retour moyen obtenu lors de l'évaluation (vrai Q-value moyen de l'état initial).
+    Le biais est approximé par la différence entre la valeur Q moyenne estimée sur 
+    les états initiaux de l'évaluation et le retour moyen obtenu (vrai Q-value).
     """
     with torch.no_grad():
-        actions = actor(batch.obs).value
-        # Estimation de la valeur Q par le critique
-        estimated_q = critic(batch.obs, actions).mean().item()
+        # Utiliser l'environnement d'évaluation pour obtenir les états initiaux
+        obs = eval_env.reset()
+        actions = actor(obs).value
+        # Estimation de la valeur Q par le critique sur les états initiaux
+        estimated_q = critic(obs, actions).mean().item()
         
     bias = estimated_q - true_return
     writer.add_scalar("bias/overestimation", bias, step)
@@ -146,10 +161,10 @@ def run_ddpg(cfg: DDPGConfig) -> Evaluator:
 
     # The actor, the critic and its target
     actor = ContinuousDeterministicActor(
-        env.observation_dim, cfg.actor_hidden, env.action_dim
+        env.observation_dim, cfg.actor_hidden, env.action_dim, cfg.use_layer_norm
     )
     target_actor = copy.deepcopy(actor)
-    critic = ContinuousQNetwork(env.observation_dim, cfg.critic_hidden, env.action_dim)
+    critic = ContinuousQNetwork(env.observation_dim, cfg.critic_hidden, env.action_dim, cfg.use_layer_norm)
     target_critic = copy.deepcopy(critic)
 
     actor_optimizer = torch.optim.Adam(actor.parameters(), lr=cfg.lr_actor)
@@ -209,7 +224,7 @@ def run_ddpg(cfg: DDPGConfig) -> Evaluator:
         evaluator.writer.add_scalar("loss/critic", critic_loss.item(), collector.steps)
         evaluator.writer.add_scalar("loss/actor", actor_loss.item(), collector.steps)
         if result := evaluator.run_if_needed(collector.steps, actor):
-            log_overestimation_bias(evaluator.writer, collector.steps, critic, actor, batch, result.mean)
+            log_overestimation_bias(evaluator.writer, collector.steps, critic, actor, evaluator.env, result.mean)
             pbar.set_description(
                 f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f}"
             )
@@ -235,13 +250,13 @@ def run_td3(cfg: TD3Config) -> Evaluator:
     env = VecEnv(cfg.env_name, cfg.n_envs, seed=cfg.seed)
 
     # Create the actor, the two critics, their targets and the optimizers
-    actor = ContinuousDeterministicActor(env.observation_dim, cfg.actor_hidden, env.action_dim)
+    actor = ContinuousDeterministicActor(env.observation_dim, cfg.actor_hidden, env.action_dim, cfg.use_layer_norm)
     target_actor = copy.deepcopy(actor)
 
-    critic_1 = ContinuousQNetwork(env.observation_dim, cfg.critic_hidden, env.action_dim)
+    critic_1 = ContinuousQNetwork(env.observation_dim, cfg.critic_hidden, env.action_dim, cfg.use_layer_norm)
     target_critic_1 = copy.deepcopy(critic_1)
 
-    critic_2 = ContinuousQNetwork(env.observation_dim, cfg.critic_hidden, env.action_dim)
+    critic_2 = ContinuousQNetwork(env.observation_dim, cfg.critic_hidden, env.action_dim, cfg.use_layer_norm)
     target_critic_2 = copy.deepcopy(critic_2)
 
     actor_optimizer = torch.optim.Adam(actor.parameters(),lr=cfg.lr_actor)
@@ -320,7 +335,7 @@ def run_td3(cfg: TD3Config) -> Evaluator:
 
 
         if result := evaluator.run_if_needed(collector.steps, actor):
-            log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, batch, result.mean)
+            log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, evaluator.env, result.mean)
             pbar.set_description(
                 f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f}"
             )
