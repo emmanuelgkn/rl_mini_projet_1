@@ -9,6 +9,7 @@ from scipy import stats
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
+from pathlib import Path
 from rl_mind.core import Action, Actor
 from rl_mind.nn import build_mlp, soft_update
 from rl_mind.env import VecEnv
@@ -68,6 +69,18 @@ class GaussianNoise(Actor[Action]):
 
     def act(self, obs: Tensor) -> Tensor:
         return self.actor.act(obs)
+
+
+class Evaluator_with_overbias(Evaluator):
+
+    def __init__(self,
+        env: VecEnv,
+        every: int,
+        run_dir: Path | None = None,
+        writer: SummaryWriter | None = None,
+    ):
+        super().__init__(env, every,run_dir,writer)
+        self.overbias_error = []
 
 def compute_critic_loss(
     gamma: float, batch: Transitions[Action], q_values: Tensor, next_q_values: Tensor
@@ -135,7 +148,8 @@ def log_overestimation_bias(
     critic: nn.Module,
     actor: Actor,
     eval_env: VecEnv,
-    true_return: float
+    true_return: float,
+    evaluator : Evaluator_with_overbias | None=None,
 ):
     """
     Calcule le biais de surestimation et l'enregistre sur TensorBoard.
@@ -148,12 +162,16 @@ def log_overestimation_bias(
         actions = actor(obs).value
         # Estimation de la valeur Q par le critique sur les états initiaux
         estimated_q = critic(obs, actions).mean().item()
+    
         
     bias = estimated_q - true_return
     writer.add_scalar("bias/overestimation", bias, step)
     writer.add_scalar("bias/estimated_q", estimated_q, step)
     writer.add_scalar("bias/true_return", true_return, step)
 
+    if evaluator is not None :
+        evaluator.overbias_error.append(bias)
+    return bias 
 
 def run_ddpg(cfg: DDPGConfig) -> Evaluator:
     torch.manual_seed(cfg.seed)
@@ -174,7 +192,7 @@ def run_ddpg(cfg: DDPGConfig) -> Evaluator:
     collector = TransitionCollector(env, GaussianNoise(actor, cfg.action_noise))
     buffer = ReplayBuffer(cfg.buffer_size)
     run_dir = run_directory(f"ddpg-{cfg.env_name}-S{cfg.seed}")
-    evaluator = Evaluator(
+    evaluator = Evaluator_with_overbias(
         VecEnv(cfg.env_name, cfg.n_eval_envs, seed=cfg.seed + 100),
         every=cfg.eval_interval,
         run_dir=run_dir,
@@ -224,9 +242,9 @@ def run_ddpg(cfg: DDPGConfig) -> Evaluator:
         evaluator.writer.add_scalar("loss/critic", critic_loss.item(), collector.steps)
         evaluator.writer.add_scalar("loss/actor", actor_loss.item(), collector.steps)
         if result := evaluator.run_if_needed(collector.steps, actor):
-            log_overestimation_bias(evaluator.writer, collector.steps, critic, actor, evaluator.env, result.mean)
+            bias=log_overestimation_bias(evaluator.writer, collector.steps, critic, actor, evaluator.env, result.mean,evaluator)
             pbar.set_description(
-                f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f}"
+                f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f} bias_error={bias:7.1f}"
             )
 
     pbar.close()
@@ -268,7 +286,7 @@ def run_td3(cfg: TD3Config) -> Evaluator:
     collector = TransitionCollector(env, GaussianNoise(actor, cfg.action_noise))
     buffer = ReplayBuffer(cfg.buffer_size)
     run_dir = run_directory(f"td3-{cfg.env_name}-S{cfg.seed}")
-    evaluator = Evaluator(
+    evaluator = Evaluator_with_overbias(
         VecEnv(cfg.env_name, cfg.n_eval_envs, seed=cfg.seed + 100),
         every=cfg.eval_interval,
         run_dir=run_dir,
@@ -335,9 +353,9 @@ def run_td3(cfg: TD3Config) -> Evaluator:
 
 
         if result := evaluator.run_if_needed(collector.steps, actor):
-            log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, evaluator.env, result.mean)
+            bias = log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, evaluator.env, result.mean,evaluator)
             pbar.set_description(
-                f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f}"
+                f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f} bias_error={bias:7.1f}"
             )
 
     pbar.close()
@@ -345,17 +363,44 @@ def run_td3(cfg: TD3Config) -> Evaluator:
 
 
 def plot_evaluations(**evaluators: Evaluator):
+
+    
+    
+    fig,ax1 = plt.subplots()
+    ax2 = ax1.twinx()
+
+    palette = ["blue","orange"]
+    palette_overbias = ["dodgerblue","darkorange"]
+
+    i=0
     for name, evaluator in evaluators.items():
+        
+        
         steps = [result.step for result in evaluator.history]
         means = torch.tensor([result.mean for result in evaluator.history])
         stds = torch.tensor(
             [float(result.rewards.std()) for result in evaluator.history]
         )
-        (line,) = plt.plot(steps, means, label=name)
-        plt.fill_between(
+        (line,) = ax1.plot(steps, means, label=f"reward of {name}",color=palette[i])
+        ax1.fill_between(
             steps, means - stds, means + stds, alpha=0.2, color=line.get_color()
         )
-    plt.xlabel("steps")
-    plt.ylabel("cumulated reward")
-    plt.legend()
+
+        if hasattr(evaluator, 'overbias_error'):
+            overbias = evaluator.overbias_error
+            (line,) = ax2.plot(steps, overbias, label= f"overbias of {name}",c=palette_overbias[i])
+
+        i+=1
+            
+
+    lines, labels = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc=0)
+
+    
+    ax1.set_xlabel("steps")
+    ax1.set_ylabel("cumulated reward")
+  
+    ax2.set_ylabel("overbias error")
+    
     plt.show()
