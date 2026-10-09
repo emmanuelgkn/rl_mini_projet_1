@@ -1,5 +1,7 @@
+logs
 outputs
 __pycache__
 instructions.md
 think.txt
 figures.md
+.DS_Store

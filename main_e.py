@@ -133,14 +133,48 @@ class DDPGConfig:
 
     actor_hidden: tuple[int, ...] = (64, 64)
     critic_hidden: tuple[int, ...] = (64, 64) # c'est ici pour changer le nombre de couches cachée
+    use_layer_norm: bool = False
+    lr_actor: float = 1e-3
+    lr_critic: float = 1e-3
+
+    #: Steps between two evaluations, and number of evaluation episodes
+    eval_interval: int = 200
+    n_eval_envs: int = 10
+
+@dataclass(frozen=True)
+class DDPGConfigLN:
+    env_name: str = "LunarLanderContinuous-v3"
+    seed: int = 1
+
+    #: Total number of environment steps
+    max_steps: int = 30_000
+    #: Number of parallel training environments
+    n_envs: int = 1
+    #: Environment steps between two gradient updates
+    steps_per_update: int = 1
+    #: Steps before learning starts
+    learning_starts: int = 1_000
+
+    #: Replay buffer capacity
+    buffer_size: int = 200_000
+    batch_size: int = 64
+
+    #: Discount factor
+    gamma: float = 0.98
+    #: Target network update coefficient
+    tau: float = 0.05
+    #: Exploration noise
+    action_noise: float = 0.1
+
+    actor_hidden: tuple[int, ...] = (64, 64)
+    critic_hidden: tuple[int, ...] = (64, 64) # c'est ici pour changer le nombre de couches cachée
     use_layer_norm: bool = True
     lr_actor: float = 1e-3
     lr_critic: float = 1e-3
 
     #: Steps between two evaluations, and number of evaluation episodes
-    eval_interval: int = 2_000
+    eval_interval: int = 200
     n_eval_envs: int = 10
-
 
 def log_overestimation_bias(
     writer: SummaryWriter,
@@ -148,30 +182,49 @@ def log_overestimation_bias(
     critic: nn.Module,
     actor: Actor,
     eval_env: VecEnv,
-    true_return: float,
+    gamma: float,
     evaluator : Evaluator_with_overbias | None=None,
 ):
     """
-    Calcule le biais de surestimation et l'enregistre sur TensorBoard.
-    Le biais est approximé par la différence entre la valeur Q moyenne estimée sur 
-    les états initiaux de l'évaluation et le retour moyen obtenu (vrai Q-value).
+    Calcule le biais de surestimation en comparant le Q estimé au vrai retour Monte Carlo
+    escompté, calculés sur la même paire (état, action) initiale.
     """
     with torch.no_grad():
-        # Utiliser l'environnement d'évaluation pour obtenir les états initiaux
         obs = eval_env.reset()
         actions = actor(obs).value
-        # Estimation de la valeur Q par le critique sur les états initiaux
         estimated_q = critic(obs, actions).mean().item()
-    
+        step_result = eval_env.step(actions)
+        obs = step_result.obs
+        rewards = step_result.reward
+        terminated = step_result.terminated
+        truncated = step_result.truncated
+        dones = terminated | truncated
         
+        mc_returns = rewards.clone()
+        discounts = torch.ones_like(rewards) * gamma
+        
+        while not dones.all():
+            actions = actor(obs).value
+            step_result = eval_env.step(actions)
+            obs = step_result.obs
+            rewards = step_result.reward
+            term = step_result.terminated
+            trunc = step_result.truncated
+            mc_returns += discounts * rewards * (~dones)
+            discounts *= gamma
+            dones |= (term | trunc)
+            
+        true_return = mc_returns.mean().item()
+    
     bias = estimated_q - true_return
+    
     writer.add_scalar("bias/overestimation", bias, step)
     writer.add_scalar("bias/estimated_q", estimated_q, step)
     writer.add_scalar("bias/true_return", true_return, step)
-
     if evaluator is not None :
         evaluator.overbias_error.append(bias)
-    return bias 
+        
+    return bias
 
 def run_ddpg(cfg: DDPGConfig) -> Evaluator:
     torch.manual_seed(cfg.seed)
@@ -242,7 +295,7 @@ def run_ddpg(cfg: DDPGConfig) -> Evaluator:
         evaluator.writer.add_scalar("loss/critic", critic_loss.item(), collector.steps)
         evaluator.writer.add_scalar("loss/actor", actor_loss.item(), collector.steps)
         if result := evaluator.run_if_needed(collector.steps, actor):
-            bias=log_overestimation_bias(evaluator.writer, collector.steps, critic, actor, evaluator.env, result.mean,evaluator)
+            bias=log_overestimation_bias(evaluator.writer, collector.steps, critic, actor, evaluator.env, cfg.gamma, evaluator)
             pbar.set_description(
                 f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f} bias_error={bias:7.1f}"
             )
@@ -262,6 +315,14 @@ class TD3Config(DDPGConfig):
     #: Clipping of the target policy noise
     target_noise_clip: float = 0.5
 
+@dataclass(frozen=True)
+class TD3ConfigLN(DDPGConfigLN):
+    #: Number of critic updates between two policy updates
+    policy_delay: int = 2
+    #: Std of the noise added to the target policy actions
+    target_noise: float = 0.2
+    #: Clipping of the target policy noise
+    target_noise_clip: float = 0.5
 
 def run_td3(cfg: TD3Config) -> Evaluator:
     torch.manual_seed(cfg.seed)
@@ -353,7 +414,7 @@ def run_td3(cfg: TD3Config) -> Evaluator:
 
 
         if result := evaluator.run_if_needed(collector.steps, actor):
-            bias = log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, evaluator.env, result.mean,evaluator)
+            bias = log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, evaluator.env, cfg.gamma, evaluator)
             pbar.set_description(
                 f"eval={result.mean:7.1f} best={evaluator.best_reward:7.1f} bias_error={bias:7.1f}"
             )
