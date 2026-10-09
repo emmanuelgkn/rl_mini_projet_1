@@ -91,3 +91,99 @@ def plot_reward(**evaluators: Evaluator):
     plt.savefig(output_path, bbox_inches="tight")
     plt.show()
     plt.close()
+
+
+
+def plot_evaluations_performance_versus_overbias(only_bias=False,**evaluators: Evaluator):
+
+    """
+    Représente sur un même graphe, la variation de la performance 
+    (le gain cumulé moyen obtenu sur les n_envs environnements simulés en parallèle, en suivant la politique de son acteur)
+    de chaque algorithme avec son biais de surestimation en fonction du nombre de pas d'entrainement.
+    """
+    
+    fig,ax1 = plt.subplots()
+    ax2 = ax1.twinx() #On crée un nouvel axe sur la figure pour représenter également l'erreur de surestimation. 
+
+    palette = ["blue","orange"] #On affecte une palette par défaut des performances de ddpg et td3
+    palette_overbias = ["dodgerblue","darkorange"] # On affecte une palette par défaut de l'erreur de suréstimation de ddpg et de TD3
+
+    
+    for i,(name, evaluator) in enumerate(evaluators.items()):
+        
+        
+        steps = [result.step for result in evaluator.history]
+        means = torch.tensor([result.mean for result in evaluator.history])
+
+        print(f"Nombre de valeurs de gains moyens de {name} : ",len(means))
+
+        
+        
+        stds = torch.tensor(
+            [float(result.rewards.std()) for result in evaluator.history]
+        )
+
+        
+        (line,) = ax1.plot(steps, means, label=f"gain cumulé de {name} avec une variabilité de +/- écart type ",color=palette[i])
+        ax1.fill_between(
+                steps, means - stds, means + stds, alpha=0.2, color=line.get_color()
+            )
+
+        if not only_bias and hasattr(evaluator, 'overbias_error'): #On vérifie que l'on s'intéresse à l'erreur de surestimation et que l'evaluateur contient l'attribut overbias_error
+            overbias = evaluator.overbias_error
+            (line,) = ax2.plot(steps, overbias, label= f"biais de surestimation de {name}",c=palette_overbias[i]) #On trace les courbes d'erreur de surestimation sur l'autre axe
+
+
+            print(f"Nombre de valeurs de biais de surrestimation de {name} : ",len(overbias), "\n") 
+
+
+
+            
+            
+            
+            correlation, p_value = pearsonr(means.numpy(), overbias) #On calcule le test de corrélation de Pearson entre les gains moyens et l'erreur de surestimation
+
+            res = stats.spearmanr(means.numpy(), overbias) #On calcule le test de corrélation de Spearman (cas plus général) entre les gains moyens et l'erreur de surestimation
+
+            correlation_spearman, pvalue_spearman = res.statistic,res.pvalue
+            
+
+            
+
+            print("------------------------------------------------------------")
+            print(f"Test de Correlation entre reward et overbias pour la variable {name} Pearson")
+            print(f"Coefficient de corrélation : {correlation:.2f}")
+            print(f"P-valeur : {p_value}")
+            print("------------------------------------------------------------")
+            print(f"Test de Correlation entre reward et overbias pour la variable {name} Spearman")
+            print(f"Coefficient de corrélation : {correlation_spearman:.2f}")
+            print(f"P-valeur : {pvalue_spearman}")
+            print("------------------------------------------------------------\n")
+
+        
+        
+            
+
+    lines, labels = ax1.get_legend_handles_labels() #On récupère les légendes des tracées sur chaque axe
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, framealpha=0.1 ,loc=2) # On les concatene en une unique légende que l'on place en haut à gauche de la figure
+
+    
+    ax1.set_xlabel("étapes")
+  
+    ax2.set_ylabel("biais de surestimation")
+
+    if not only_bias :
+
+        ax1.set_ylabel("moyenne des gains cumulés")
+
+        plt.title("Variation de la moyenne des gains (Performance) et du biais \n" + "de surestimation par rapport au numéro d'étape et aux algorithmes testés")
+
+        plt.savefig("./images/cumulated_reward_and_overbias_error_with_respect_to_the_steps")
+
+    else:
+        plt.title("Variation des biais de surestimation par rapport au numéro d'étape et aux algorithmes testés")
+
+        plt.savefig("./images/overbias_error_with_respect_to_the_steps")
+        
+    plt.show()

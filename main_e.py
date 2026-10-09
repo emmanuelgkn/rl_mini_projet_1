@@ -4,8 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import rl_mind.envs
+import numpy as np
 from dataclasses import dataclass, replace
 from scipy import stats
+from scipy.stats import pearsonr
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
@@ -72,6 +74,11 @@ class GaussianNoise(Actor[Action]):
 
 
 class Evaluator_with_overbias(Evaluator):
+    """
+    Construit un nouvelle evaluateur qui va stocker le résultat du calcul de 
+    l'erreur de surestimation à chaque eval_interval pas.
+    
+    """
 
     def __init__(self,
         env: VecEnv,
@@ -190,20 +197,20 @@ def log_overestimation_bias(
     escompté, calculés sur la même paire (état, action) initiale.
     """
     with torch.no_grad():
-        obs = eval_env.reset()
-        actions = actor(obs).value
-        estimated_q = critic(obs, actions).mean().item()
-        step_result = eval_env.step(actions)
-        obs = step_result.obs
-        rewards = step_result.reward
-        terminated = step_result.terminated
+        obs = eval_env.reset() #On remet à jour les 10 environnements d'évaluation
+        actions = actor(obs).value #On predit leurs actions avec l'acteur 
+        estimated_q = critic(obs, actions).mean().item() #On estime Q avec le critique 
+        step_result = eval_env.step(actions) #On met à jour l'état de chaque agent après avoir effectué leurs actions
+        obs = step_result.obs #On récupère chaque nouveaux états 
+        rewards = step_result.reward #On récupère les gains de la transition
+        terminated = step_result.terminated 
         truncated = step_result.truncated
-        dones = terminated | truncated
+        dones = terminated | truncated # On verifie que tous les environnements ne sont pas terminés ou tronqués 
         
-        mc_returns = rewards.clone()
-        discounts = torch.ones_like(rewards) * gamma
+        mc_returns = rewards.clone() #On initialise le retour de Monte Carlo comme la table des gains que l'on va mettre à jours 
+        discounts = torch.ones_like(rewards) * gamma #On multiplie par le facteur d’actualisation
         
-        while not dones.all():
+        while not dones.all(): #Tant que les environnements n'ont pas été interrompus, on prédit les actions suivantes par l'acteur, on met à jour les environnements et on récupère leurs gains qu'on multiplie par le facteur d'actualisation exponentié au numéro d'étape qu'on ajoute à la table du retour 
             actions = actor(obs).value
             step_result = eval_env.step(actions)
             obs = step_result.obs
@@ -214,15 +221,15 @@ def log_overestimation_bias(
             discounts *= gamma
             dones |= (term | trunc)
             
-        true_return = mc_returns.mean().item()
+        true_return = mc_returns.mean().item() 
     
-    bias = estimated_q - true_return
+    bias = estimated_q - true_return #on déduit le biais en faisant la différence de l'estimation du gain par le critique et le retour de Monte Carlo
     
     writer.add_scalar("bias/overestimation", bias, step)
     writer.add_scalar("bias/estimated_q", estimated_q, step)
     writer.add_scalar("bias/true_return", true_return, step)
     if evaluator is not None :
-        evaluator.overbias_error.append(bias)
+        evaluator.overbias_error.append(bias) #On enregistre ce biais en l'ajoutant à l'attribut overbias_error de l'evaluateur.
         
     return bias
 
@@ -306,7 +313,7 @@ def run_ddpg(cfg: DDPGConfig) -> Evaluator:
 
 
 
-@dataclass(frozen=True)
+
 class TD3Config(DDPGConfig):
     #: Number of critic updates between two policy updates
     policy_delay: int = 2
@@ -410,9 +417,6 @@ def run_td3(cfg: TD3Config) -> Evaluator:
         evaluator.writer.add_scalar("loss/critic", critic_loss.item(), collector.steps) 
 
 
-        # assert False, 'Not implemented yet'
-
-
         if result := evaluator.run_if_needed(collector.steps, actor):
             bias = log_overestimation_bias(evaluator.writer, collector.steps, critic_1, actor, evaluator.env, cfg.gamma, evaluator)
             pbar.set_description(
@@ -423,45 +427,3 @@ def run_td3(cfg: TD3Config) -> Evaluator:
     return evaluator
 
 
-def plot_evaluations(**evaluators: Evaluator):
-
-    
-    
-    fig,ax1 = plt.subplots()
-    ax2 = ax1.twinx()
-
-    palette = ["blue","orange"]
-    palette_overbias = ["dodgerblue","darkorange"]
-
-    i=0
-    for name, evaluator in evaluators.items():
-        
-        
-        steps = [result.step for result in evaluator.history]
-        means = torch.tensor([result.mean for result in evaluator.history])
-        stds = torch.tensor(
-            [float(result.rewards.std()) for result in evaluator.history]
-        )
-        (line,) = ax1.plot(steps, means, label=f"reward of {name}",color=palette[i])
-        ax1.fill_between(
-            steps, means - stds, means + stds, alpha=0.2, color=line.get_color()
-        )
-
-        if hasattr(evaluator, 'overbias_error'):
-            overbias = evaluator.overbias_error
-            (line,) = ax2.plot(steps, overbias, label= f"overbias of {name}",c=palette_overbias[i])
-
-        i+=1
-            
-
-    lines, labels = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax2.legend(lines + lines2, labels + labels2, loc=0)
-
-    
-    ax1.set_xlabel("steps")
-    ax1.set_ylabel("cumulated reward")
-  
-    ax2.set_ylabel("overbias error")
-    
-    plt.show()
